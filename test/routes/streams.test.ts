@@ -2,9 +2,9 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { prisma } from '../../src/db.js';
 import { buildServer } from '../../src/server.js';
-import { fakeAddress, resetDb } from '../helpers/db.js';
+import { fakeAddress, fakeContractAddress, resetDb } from '../helpers/db.js';
 
-describe('GET /streams', () => {
+describe('GET /v1/streams', () => {
   afterEach(async () => {
     await resetDb();
   });
@@ -15,7 +15,12 @@ describe('GET /streams', () => {
     const donorA = await prisma.donor.create({ data: { address: fakeAddress('A') } });
     const donorB = await prisma.donor.create({ data: { address: fakeAddress('B') } });
     const ngo = await prisma.ngo.create({
-      data: { ownerAddress: fakeAddress('C'), name: 'NGO', verified: true },
+      data: {
+        ownerAddress: fakeAddress('C'),
+        name: 'NGO',
+        displayName: 'Public NGO Name',
+        verified: true,
+      },
     });
 
     await prisma.stream.create({
@@ -43,13 +48,14 @@ describe('GET /streams', () => {
 
     const response = await app.inject({
       method: 'GET',
-      url: `/streams?donor=${donorA.address}`,
+      url: `/v1/streams?donor=${donorA.address}`,
     });
     expect(response.statusCode).toBe(200);
 
     const body = response.json();
     expect(body.streams).toHaveLength(1);
     expect(body.streams[0].onChainId).toBe('1');
+    expect(body.streams[0].ngo.name).toBe('Public NGO Name');
     // Serialized as a string — the route must never hand back a raw BigInt.
     expect(typeof body.streams[0].onChainId).toBe('string');
     expect(body.hasMore).toBe(false);
@@ -60,7 +66,7 @@ describe('GET /streams', () => {
   it('400s on a malformed donor address instead of matching nothing silently', async () => {
     const app = buildServer();
 
-    const response = await app.inject({ method: 'GET', url: '/streams?donor=not-an-address' });
+    const response = await app.inject({ method: 'GET', url: '/v1/streams?donor=not-an-address' });
     expect(response.statusCode).toBe(400);
 
     await app.close();
@@ -69,9 +75,60 @@ describe('GET /streams', () => {
   it('400s on a malformed ngo id', async () => {
     const app = buildServer();
 
-    const response = await app.inject({ method: 'GET', url: '/streams?ngo=not-a-uuid' });
+    const response = await app.inject({ method: 'GET', url: '/v1/streams?ngo=not-a-uuid' });
     expect(response.statusCode).toBe(400);
 
+    await app.close();
+  });
+
+  it('filters by token contract address', async () => {
+    const app = buildServer();
+
+    const donor = await prisma.donor.create({ data: { address: fakeAddress('A') } });
+    const ngo = await prisma.ngo.create({
+      data: { ownerAddress: fakeAddress('B'), name: 'NGO', verified: true },
+    });
+    const targetToken = fakeContractAddress('C');
+
+    await prisma.stream.createMany({
+      data: [
+        {
+          onChainId: 1n,
+          donorId: donor.id,
+          ngoId: ngo.id,
+          tokenAddress: targetToken,
+          rate: '1',
+          balance: '100',
+          withdrawn: '0',
+        },
+        {
+          onChainId: 2n,
+          donorId: donor.id,
+          ngoId: ngo.id,
+          tokenAddress: fakeContractAddress('D'),
+          rate: '1',
+          balance: '200',
+          withdrawn: '0',
+        },
+      ],
+    });
+
+    const response = await app.inject({ method: 'GET', url: `/v1/streams?token=${targetToken}` });
+
+    expect(response.statusCode).toBe(200);
+    expect(
+      response.json().streams.map((stream: { onChainId: string }) => stream.onChainId),
+    ).toEqual(['1']);
+
+    await app.close();
+  });
+
+  it('400s on a malformed token contract address', async () => {
+    const app = buildServer();
+
+    const response = await app.inject({ method: 'GET', url: '/v1/streams?token=not-a-contract' });
+
+    expect(response.statusCode).toBe(400);
     await app.close();
   });
 
@@ -94,12 +151,15 @@ describe('GET /streams', () => {
       })),
     });
 
-    const coerced = await app.inject({ method: 'GET', url: `/streams?ngo=${ngo.id}&limit=2` });
+    const coerced = await app.inject({ method: 'GET', url: `/v1/streams?ngo=${ngo.id}&limit=2` });
     expect(coerced.statusCode).toBe(200);
     expect(coerced.json().streams).toHaveLength(2);
     expect(coerced.json().hasMore).toBe(true);
 
-    const tooLarge = await app.inject({ method: 'GET', url: `/streams?ngo=${ngo.id}&limit=101` });
+    const tooLarge = await app.inject({
+      method: 'GET',
+      url: `/v1/streams?ngo=${ngo.id}&limit=101`,
+    });
     expect(tooLarge.statusCode).toBe(400);
 
     await app.close();
@@ -109,7 +169,7 @@ describe('GET /streams', () => {
     const app = buildServer();
 
     const donor = await prisma.donor.create({ data: { address: fakeAddress('A') } });
-    const ngo = await prisma.ngo.create({
+    const ngo = await prisma.go.create({
       data: { ownerAddress: fakeAddress('B'), name: 'NGO', verified: true },
     });
     const otherNgo = await prisma.ngo.create({
@@ -145,7 +205,7 @@ describe('GET /streams', () => {
 
     const firstPage = await app.inject({
       method: 'GET',
-      url: `/streams?ngo=${ngo.id}&limit=2`,
+      url: `/v1/streams?ngo=${ngo.id}&limit=2`,
     });
     expect(firstPage.statusCode).toBe(200);
     const firstBody = firstPage.json();
@@ -156,7 +216,7 @@ describe('GET /streams', () => {
 
     const secondPage = await app.inject({
       method: 'GET',
-      url: `/streams?ngo=${ngo.id}&limit=2&cursor=${firstBody.nextCursor}`,
+      url: `/v1/streams?ngo=${ngo.id}&limit=2&cursor=${firstBody.nextCursor}`,
     });
     expect(secondPage.statusCode).toBe(200);
     const secondBody = secondPage.json();
@@ -187,7 +247,7 @@ describe('GET /streams', () => {
       })),
     });
 
-    const response = await app.inject({ method: 'GET', url: `/streams?ngo=${ngo.id}` });
+    const response = await app.inject({ method: 'GET', url: `/v1/streams?ngo=${ngo.id}` });
     expect(response.statusCode).toBe(200);
 
     const body = response.json();
@@ -201,10 +261,10 @@ describe('GET /streams', () => {
     const app = buildServer();
 
     const donor = await prisma.donor.create({ data: { address: fakeAddress('A') } });
-    const ngo = await prisma.ngo.create({
+    const ngo = await prisma.go.create({
       data: { ownerAddress: fakeAddress('B'), name: 'Target NGO', verified: true },
     });
-    const otherNgo = await prisma.ngo.create({
+    const otherNgo = await prisma.go.create({
       data: { ownerAddress: fakeAddress('C'), name: 'Other NGO', verified: true },
     });
 
@@ -233,7 +293,7 @@ describe('GET /streams', () => {
 
     const response = await app.inject({
       method: 'GET',
-      url: `/streams?ngoAddress=${ngo.ownerAddress}`,
+      url: `/v1/streams?ngoAddress=${ngo.ownerAddress}`,
     });
     expect(response.statusCode).toBe(200);
 
@@ -248,7 +308,7 @@ describe('GET /streams', () => {
     const app = buildServer();
 
     const donor = await prisma.donor.create({ data: { address: fakeAddress('A') } });
-    const ngo = await prisma.ngo.create({
+    const ngo = await prisma.go.create({
       data: { ownerAddress: fakeAddress('B'), name: 'NGO', verified: true },
     });
 
@@ -266,7 +326,7 @@ describe('GET /streams', () => {
 
     const response = await app.inject({
       method: 'GET',
-      url: `/streams?ngoAddress=${fakeAddress('Z')}`,
+      url: `/v1/streams?ngoAddress=${fakeAddress('Z')}`,
     });
     expect(response.statusCode).toBe(200);
 
@@ -281,7 +341,7 @@ describe('GET /streams', () => {
 
     const response = await app.inject({
       method: 'GET',
-      url: '/streams?ngoAddress=not-an-address',
+      url: '/v1/streams?ngoAddress=not-an-address',
     });
     expect(response.statusCode).toBe(400);
 
@@ -323,7 +383,7 @@ describe('GET /streams', () => {
 
     const response = await app.inject({
       method: 'GET',
-      url: `/streams?donor=${donor.address}&status=ACTIVE`,
+      url: `/v1/streams?donor=${donor.address}&status=ACTIVE`,
     });
     expect(response.statusCode).toBe(200);
 
@@ -334,7 +394,7 @@ describe('GET /streams', () => {
 
     await app.close();
   });
-  it('exposes lastRate for a cancelled stream via GET /streams/:id', async () => {
+  it('exposes lastRate for a cancelled stream via GET /v1/streams/:id', async () => {
     const app = buildServer();
 
     const donor = await prisma.donor.create({ data: { address: fakeAddress('M') } });
@@ -355,7 +415,7 @@ describe('GET /streams', () => {
       },
     });
 
-    const response = await app.inject({ method: 'GET', url: `/streams/${stream.id}` });
+    const response = await app.inject({ method: 'GET', url: `/v1/streams/${stream.id}` });
     expect(response.statusCode).toBe(200);
 
     const body = response.json();
@@ -365,10 +425,9 @@ describe('GET /streams', () => {
 
     await app.close();
   });
-
 });
 
-describe('GET /streams/:id', () => {
+describe('GET /v1/streams/:id', () => {
   afterEach(async () => {
     await resetDb();
   });
@@ -392,7 +451,7 @@ describe('GET /streams/:id', () => {
       },
     });
 
-    const response = await app.inject({ method: 'GET', url: `/streams/${stream.id}` });
+    const response = await app.inject({ method: 'GET', url: `/v1/streams/${stream.id}` });
     expect(response.statusCode).toBe(200);
 
     const body = response.json();
@@ -403,34 +462,42 @@ describe('GET /streams/:id', () => {
     await app.close();
   });
 
-  it('404s for an id that does not exist', async () => {
-    const app = buildServer();
-
-    const response = await app.inject({
-      method: 'GET',
-      url: '/streams/00000000-0000-0000-0000-000000000000',
-    });
-    expect(response.statusCode).toBe(404);
-
-    await app.close();
-  });
-
-  it('400s for a malformed id instead of leaking a Prisma error', async () => {
-    const app = buildServer();
-
-    const response = await app.inject({ method: 'GET', url: '/streams/not-a-uuid' });
-    expect(response.statusCode).toBe(400);
-
-    await app.close();
-  });
-
-  it('returns null name and registered false for a stream to an unregistered NGO', async () => {
+  it('includes createdTxHash in single stream response', async () => {
     const app = buildServer();
 
     const donor = await prisma.donor.create({ data: { address: fakeAddress('A') } });
-    // Placeholder NGO: name is empty, not yet registered on-chain.
     const ngo = await prisma.ngo.create({
-      data: { ownerAddress: fakeAddress('B'), name: '', verified: false },
+      data: { ownerAddress: fakeAddress('B'), name: 'NGO', verified: true },
+    });
+    const txHash = 'c4515e3bdc0897f21cc5dbec8c82cf0a936d4741cb74a8e158eb51b9fb00411a';
+    const stream = await prisma.stream.create({
+      data: {
+        onChainId: 1n,
+        donorId: donor.id,
+        ngoId: ngo.id,
+        tokenAddress: fakeAddress('D'),
+        rate: '1',
+        balance: '100',
+        withdrawn: '0',
+        createdTxHash: txHash,
+      },
+    });
+
+    const response = await app.inject({ method: 'GET', url: `/streams/${stream.id}` });
+    expect(response.statusCode).toBe(200);
+
+    const body = response.json();
+    expect(body.createdTxHash).toBe(txHash);
+
+    await app.close();
+  });
+
+  it('returns null createdTxHash for legacy streams without one', async () => {
+    const app = buildServer();
+
+    const donor = await prisma.donor.create({ data: { address: fakeAddress('A') } });
+    const ngo = await prisma.ngo.create({
+      data: { ownerAddress: fakeAddress('B'), name: 'NGO', verified: true },
     });
     const stream = await prisma.stream.create({
       data: {
@@ -448,10 +515,185 @@ describe('GET /streams/:id', () => {
     expect(response.statusCode).toBe(200);
 
     const body = response.json();
+    expect(body.createdTxHash).toBeNull();
+
+    await app.close();
+  });
+
+  it('404s for an id that does not exist', async () => {
+    const app = buildServer();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/streams/00000000-0000-0000-0000-000000000000',
+    });
+    expect(response.statusCode).toBe(404);
+
+    await app.close();
+  });
+
+  it('400s for a malformed id instead of leaking a Prisma error', async () => {
+    const app = buildServer();
+
+    const response = await app.inject({ method: 'GET', url: '/v1/streams/not-a-uuid' });
+    expect(response.statusCode).toBe(400);
+
+    await app.close();
+  });
+
+  it('returns null name and registered false for a stream to an unregistered NGO', async () => {
+    const app = buildServer();
+
+    const donor = await prisma.donor.create({ data: { address: fakeAddress('A') } });
+    // Placeholder NGO: name is empty, not yet registered on-chain.
+    const ngo = await prisma.go.create({
+      data: { ownerAddress: fakeAddress('B'), name: '', verified: false },
+    });
+    const stream = await prisma.stream.create({
+      data: {
+        onChainId: 1n,
+        donorId: donor.id,
+        ngoId: ngo.id,
+        tokenAddress: fakeAddress('D'),
+        rate: '1',
+        balance: '100',
+        withdrawn: '0',
+      },
+    });
+
+    const response = await app.inject({ method: 'GET', url: `/v1/streams/${stream.id}` });
+    expect(response.statusCode).toBe(200);
+
+    const body = response.json();
     expect(body.ngo.name).toBeNull();
     expect(body.ngo.registered).toBe(false);
     // ownerAddress is still present so clients can display the wallet address if they choose.
     expect(body.ngo.ownerAddress).toBe(ngo.ownerAddress);
+
+    await app.close();
+  });
+});
+
+describe('GET /streams/:id/activity', () => {
+  afterEach(async () => {
+    await resetDb();
+  });
+
+  it("returns a stream's events newest first", async () => {
+    const app = buildServer();
+
+    const donor = await prisma.donor.create({ data: { address: fakeAddress('A') } });
+    const ngo = await prisma.go.create({
+      data: { ownerAddress: fakeAddress('B'), name: 'NGO', verified: true },
+    });
+    const stream = await prisma.stream.create({
+      data: {
+        onChainId: 1n,
+        donorId: donor.id,
+        ngoId: ngo.id,
+        tokenAddress: fakeAddress('D'),
+        rate: '1',
+        balance: '100',
+        withdrawn: '0',
+      },
+    });
+
+    // Created oldest first so the response order is CANCELLED -> WITHDRAWAL -> TOP_UP.
+    for (const type of ['TOP_UP', 'WITHDRAWAL', 'CANCELLED'] as const) {
+      await prisma.streamEvent.create({
+        data: { streamId: stream.id, type, amount: '10' },
+      });
+    }
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/streams/${stream.id}/activity`,
+    });
+    expect(response.statusCode).toBe(200);
+
+    const body = response.json();
+    expect(body.events).toHaveLength(3);
+    expect(body.events.map((e: { type: string }) => e.type)).toEqual([
+      'CANCELLED',
+      'WITHDRAWAL',
+      'TOP_UP',
+    ]);
+    expect(body.hasMore).toBe(false);
+
+    await app.close();
+  });
+
+  it('paginates through events with a cursor', async () => {
+    const app = buildServer();
+
+    const donor = await prisma.donor.create({ data: { address: fakeAddress('A') } });
+    const ngo = await prisma.ngo.create({
+      data: { ownerAddress: fakeAddress('B'), name: 'NGO', verified: true },
+    });
+    const stream = await prisma.stream.create({
+      data: {
+        onChainId: 1n,
+        donorId: donor.id,
+        ngoId: ngo.id,
+        tokenAddress: fakeAddress('D'),
+        rate: '1',
+        balance: '100',
+        withdrawn: '0',
+      },
+    });
+
+    for (const type of ['TOP_UP', 'WITHDRAWAL', 'CANCELLED'] as const) {
+      await prisma.streamEvent.create({
+        data: { streamId: stream.id, type, amount: '10' },
+      });
+    }
+
+    const firstPage = await app.inject({
+      method: 'GET',
+      url: `/streams/${stream.id}/activity?limit=2`,
+    });
+    expect(firstPage.statusCode).toBe(200);
+    const firstBody = firstPage.json();
+    expect(firstBody.events).toHaveLength(2);
+    expect(firstBody.hasMore).toBe(true);
+    expect(firstBody.events.map((e: { type: string }) => e.type)).toEqual([
+      'CANCELLED',
+      'WITHDRAWAL',
+    ]);
+
+    const secondPage = await app.inject({
+      method: 'GET',
+      url: `/streams/${stream.id}/activity?limit=2&cursor=${firstBody.events[1].id}`,
+    });
+    expect(secondPage.statusCode).toBe(200);
+    const secondBody = secondPage.json();
+    expect(secondBody.events).toHaveLength(1);
+    expect(secondBody.events[0].type).toBe('TOP_UP');
+    expect(secondBody.hasMore).toBe(false);
+
+    await app.close();
+  });
+
+  it('404s for an unknown stream', async () => {
+    const app = buildServer();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/streams/00000000-0000-0000-0000-000000000000/activity',
+    });
+    expect(response.statusCode).toBe(404);
+
+    await app.close();
+  });
+
+  it('400s on a malformed stream id', async () => {
+    const app = buildServer();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/streams/not-a-uuid/activity',
+    });
+    expect(response.statusCode).toBe(400);
 
     await app.close();
   });

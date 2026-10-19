@@ -25,6 +25,7 @@ which database rows it creates or updates when it does.
 |---|---|---|
 | `register` | Yes | Upserts `ngos` row (`ownerAddress`, `name`, `verified = false`). Updates `name` if the row already exists. |
 | `approved` | Yes | Sets `verified = true` on the matching `ngos` row via `updateMany` (no-ops if the row does not exist yet — safe for a mid-history start). |
+| `revoked` | Yes | Sets `verified = false` on the matching `ngos` row via `updateMany` (no-ops if the row does not exist yet). |
 
 Handler: [`src/indexer/handlers/ngoRegistry.ts`](../src/indexer/handlers/ngoRegistry.ts)
 
@@ -34,17 +35,39 @@ Handler: [`src/indexer/handlers/ngoRegistry.ts`](../src/indexer/handlers/ngoRegi
 |---|---|---|
 | `created` | Yes | Upserts `donors` and `ngos` rows for the involved addresses (creating placeholders if unseen), then upserts a `streams` row with `status = ACTIVE`, initial `balance`, and `withdrawn = 0`. Emits a `stream_created` webhook notification. |
 | `withdraw` | Yes | Subtracts the accrued amount from `streams.balance` and adds it to `streams.withdrawn`. No-ops if the stream row does not exist. Emits a `stream_withdrawn` notification. |
-| `cancel` | Yes | Adds the settled amount to `streams.withdrawn`, zeroes `balance` and `rate`, sets `status = CANCELLED`. No-ops if the stream row does not exist. Emits a `stream_cancelled` notification. |
+| `cancel`| Yes | Adds the settled amount to `streams.withdrawn`, zeroes `balance` and `rate`, sets `status = CANCELLED`. No-ops if the stream row does not exist. Emits a `stream_cancelled` notification. |
 | `topup` | No | The event only publishes the new deposit amount, not how much accrued and settled to the NGO during the same call, so the post-topup balance cannot be reconstructed from the payload alone without either a contract read or duplicating the accrual math. Tracked as a follow-up. |
 | `ratemod` | No | Same reason as `topup` — the new rate is known but the accrual that settled at the moment of the rate change is not. Tracked as a follow-up. |
 
 Handler: [`src/indexer/handlers/donationVault.ts`](../src/indexer/handlers/donationVault.ts)
 
+## Soroban event decoding assumptions
+
+The handlers below use `scValToNative` followed by TypeScript casts; they do
+not validate the decoded values against a runtime schema. Topic positions
+listed here are the positions the handler reads. The event name is a Soroban
+symbol in topic position 0.
+
+| Contract | Event | Topic values decoded after the event name | Value decoded |
+|---|---|---|---|
+| ngo-registry | `register` | Position 1: owner address (`ScAddress`). | String (`ScString`), used as the NGO name. |
+| ngo-registry | `approved` | Position 1: owner address (`ScAddress`). | Not read by the handler. |
+| ngo-registry | `revoked` | Position 1: owner address (`ScAddress`). | Not read by the handler. |
+| donation-vault | `created` | Position 1: stream ID (`u64`). | Vector of five values, in order: donor address (`ScAddress`), NGO address (`ScAddress`), token address (`ScAddress`), initial deposit (`i128`), and rate (`i128`). |
+| donation-vault | `withdraw` | Position 1: stream ID (`u64`). | Accrued amount (`i128`). |
+| donation-vault | `cancel` | Position 1: stream ID (`u64`). | Vector of two values, in order: accrued amount (`i128`) and refund (`i128`). |
+
+These are the shapes the current handler code assumes, not runtime-enforced
+schemas. A mismatch can make `scValToNative`, destructuring, or a later
+conversion throw. The worker catches handler failures, records the event as a
+dead letter, and advances the checkpoint when that record succeeds. See the
+related [malformed-event hardening issue #85](https://github.com/StreamGive/streamgive-backend/issues/85).
+
 ## Checkpoint
 
 The indexer stores the last ledger it successfully processed in the
 `indexer_checkpoints` table (a single row with `id = 'main'`).  On startup it
-reads this row and resumes from `lastLedger + 1`, so a restart never
+reads this row and resumes from `lastLedger +1`, so a restart never
 re-processes already-seen events.
 
 **First run** — if no checkpoint row exists the indexer writes the current
@@ -55,8 +78,7 @@ indexed; the contract's full history is not back-filled.
 **Per-event checkpointing** — the checkpoint is saved after each individual
 event, not once per batch. Several handlers apply relative deltas
 (`balance -= accrued`, etc.), so replaying an already-applied event after a
-crash would double-count it. Saving after each event bounds the damage to "at
-most the in-flight event" on a crash.
+Crash would double-count it. Saving after each event bounds the damage to "at most the in-flight event" on a crash.
 
 ### Failed events
 
@@ -98,6 +120,14 @@ Two ways the checkpoint can fall outside the window:
 | **Ahead of the tip** | The indexer checkpoints at the latest ledger, so the very next poll asks for `latest + 1`, which has not closed yet. The poll returns immediately and waits for the next interval — no action needed. |
 | **Behind the retention window** | If the process is down for longer than the RPC's retention period, the saved checkpoint ages out. The indexer detects the `-32600` error, logs a warning that events in the gap were missed, skips the checkpoint forward to the current ledger, and resumes. This keeps the indexer running rather than looping on a permanent error, at the cost of a gap in the indexed history. |
 
+Skipping the gap is permanent for the running indexer: the missed contract
+events are not fetched later. As a result, database projections may be missing
+or stale, including NGO registrations and approvals and stream creation,
+withdrawal, or cancellation state. Restarting the process does not recover
+them because the checkpoint has already advanced. The verification
+reconciliation script can repair NGO `verified` flags, but it does not replay
+the other event effects.
+
 The skip-forward warning is intentionally loud:
 
 ```
@@ -105,8 +135,41 @@ indexer: checkpoint <N> has aged out of the RPC's retention window —
 skipping to ledger <M>. Events in between were missed and will not be indexed.
 ```
 
-If you need complete history after an outage longer than the retention window,
-replay the missed ledger range from an archive node (not currently automated).
+To recover complete history, replay the missed ledger range from an archive
+RPC and reconcile the affected database projections. This is not automated;
+use a purpose-built reindex/backfill process rather than simply moving the
+checkpoint backward, which could apply relative stream balance changes twice.
+The planned tooling is tracked in the [backfill issue #11](https://github.com/StreamGive/streamgive-backend/issues/11).
+## Verification reconciliation
+
+If the indexer misses an `approved` / `revoked` event (e.g. because the
+checkpoint aged out of the RPC retention window), an NGO's `verified` flag
+can drift from the on-chain truth. The reconciliation script reads each NGO's
+verified status directly from the ngo-registry contract and compares it against
+the database, reporting (and optionally fixing) any mismatches.
+
+### Running it
+
+The script lives at [`src/scripts/reconcileVerification.ts`](../src/scripts/reconcileVerification.ts).
+It requires `NGO_REGISTRY_CONTRACT_ID` and a Stellar RPC endpoint to be set
+(the same environment variables the indexer uses), and access to the database.
+
+Report only (default) — prints mismatches and exits with code 1 if any are found:
+
+```bash
+npm run reconcile:verification
+```
+
+Apply fixes — updates the database to match on-chain status:
+
+```bash
+npm run reconcile:verification -- --fix
+```
+
+Add `--quiet` to suppress the per-NGO output and only print the final summary.
+
+The script exits with code 0 when everything matches (or when `--fix` is used),
+and code 1 when mismatches are found in report-only mode.
 
 ## Polling and backoff
 
@@ -138,4 +201,3 @@ ledger range. The log line names the failure count and the next delay:
 
 ```
 indexer poll failed (3 in a row) — retrying in 20000ms
-```
